@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Texting Mafia</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div id="name-modal" class="modal hidden">
+      <div class="modal-card">
+        <h2>Choose Your Name</h2>
+        <p>This name is stored on this device only.</p>
+        <form id="name-form">
+          <input id="name-input" maxlength="24" placeholder="Your name" required />
+          <button type="submit">Save Name</button>
+        </form>
+      </div>
+    </div>
+
+    <main class="app-shell">
+      <header class="top-bar">
+        <h1>Texting Mafia</h1>
+        <div class="identity">
+          <span id="name-display">Name: -</span>
+          <button id="change-name-btn" class="ghost-btn">Change</button>
+        </div>
+      </header>
+
+      <section id="menu-screen" class="screen">
+        <div class="card">
+          <h2>Play Online</h2>
+          <p>Create a lobby and share the code, or join an existing one.</p>
+          <div class="menu-actions">
+            <button id="create-lobby-btn">Create Lobby</button>
+          </div>
+          <div class="join-row">
+            <input id="join-code-input" maxlength="5" placeholder="Join code" />
+            <button id="join-lobby-btn">Join Lobby</button>
+          </div>
+          <p class="hint">Minimum 4 players. One mafia, one guardian angel.</p>
+          <p id="menu-error" class="error-text"></p>
+        </div>
+      </section>
+
+      <section id="lobby-screen" class="screen hidden">
+        <div class="card">
+          <h2>Lobby</h2>
+          <p>
+            Join Code:
+            <strong id="lobby-code">-----</strong>
+            <button id="copy-code-btn" class="ghost-btn">Copy</button>
+          </p>
+          <div class="split">
+            <div>
+              <h3>Players</h3>
+              <ul id="lobby-players" class="list"></ul>
+            </div>
+            <div class="lobby-controls">
+              <button id="start-game-btn">Start Game</button>
+              <button id="leave-lobby-btn" class="ghost-btn">Leave</button>
+              <p id="start-hint" class="hint"></p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="game-screen" class="screen hidden">
+        <div class="status-grid">
+          <div class="status-card">
+            <p class="label">Role</p>
+            <p id="role-value">-</p>
+          </div>
+          <div class="status-card">
+            <p class="label">State</p>
+            <p id="alive-value">-</p>
+          </div>
+          <div class="status-card">
+            <p class="label">Round</p>
+            <p id="round-value">-</p>
+          </div>
+          <div class="status-card">
+            <p class="label">Time Left</p>
+            <p id="timer-value">00:00</p>
+          </div>
+          <div class="status-card">
+            <p class="label">Winner</p>
+            <p id="winner-value">-</p>
+          </div>
+        </div>
+
+        <p id="role-reveal" class="role-reveal hidden"></p>
+        <p id="cooldown-text" class="hint"></p>
+
+        <div class="game-layout">
+          <aside class="card panel">
+            <h3>Players</h3>
+            <ul id="game-players" class="list players-list"></ul>
+            <button id="leave-game-btn" class="ghost-btn">Leave Game</button>
+          </aside>
+
+          <section class="card panel chat-panel">
+            <div class="chat-tabs">
+              <button id="main-tab-btn" class="tab-btn active">Main</button>
+              <button id="dm-tab-btn" class="tab-btn">Private</button>
+            </div>
+
+            <div id="main-chat-view" class="chat-view"></div>
+
+            <div id="dm-chat-wrapper" class="hidden">
+              <label for="dm-target-select">Private with:</label>
+              <select id="dm-target-select"></select>
+              <div id="dm-chat-view" class="chat-view"></div>
+            </div>
+
+            <form id="chat-form" class="chat-form">
+              <input id="chat-input" maxlength="280" placeholder="Send a message..." />
+              <button type="submit">Send</button>
+            </form>
+            <p id="chat-error" class="error-text"></p>
+          </section>
+
+          <aside class="card panel">
+            <h3>Round Results</h3>
+            <ul id="history-list" class="list"></ul>
+          </aside>
+        </div>
+      </section>
+    </main>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>
