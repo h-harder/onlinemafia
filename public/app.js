@@ -1,10 +1,15 @@
-const socket = io();
-
 const STORAGE_NAME_KEY = "texting_mafia_name";
+const STORAGE_BACKEND_KEY = "texting_mafia_backend";
 
+let ws = null;
 let state = null;
+let session = null;
 let activeTab = "main";
 let selectedDmPeerId = null;
+let nextReqId = 1;
+let expectedClose = false;
+
+const pendingAcks = new Map();
 
 const els = {
   nameModal: document.getElementById("name-modal"),
@@ -16,6 +21,10 @@ const els = {
   menuScreen: document.getElementById("menu-screen"),
   lobbyScreen: document.getElementById("lobby-screen"),
   gameScreen: document.getElementById("game-screen"),
+
+  backendUrlInput: document.getElementById("backend-url-input"),
+  saveBackendBtn: document.getElementById("save-backend-btn"),
+  backendStatus: document.getElementById("backend-status"),
 
   createLobbyBtn: document.getElementById("create-lobby-btn"),
   joinLobbyBtn: document.getElementById("join-lobby-btn"),
@@ -53,12 +62,56 @@ const els = {
   historyList: document.getElementById("history-list")
 };
 
+function normalizeBackendUrl(rawUrl) {
+  let value = String(rawUrl || "").trim();
+  if (!value) {
+    return "";
+  }
+  if (!/^https?:\/\//i.test(value)) {
+    value = `https://${value}`;
+  }
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return "";
+    }
+    return parsed.origin;
+  } catch {
+    return "";
+  }
+}
+
+function fallbackBackendUrl() {
+  if (location.hostname === "localhost" || location.hostname === "127.0.0.1") {
+    return "http://127.0.0.1:8787";
+  }
+  return "";
+}
+
 function getStoredName() {
   return (localStorage.getItem(STORAGE_NAME_KEY) || "").trim();
 }
 
 function setStoredName(name) {
   localStorage.setItem(STORAGE_NAME_KEY, name);
+}
+
+function getStoredBackendUrl() {
+  const stored = normalizeBackendUrl(localStorage.getItem(STORAGE_BACKEND_KEY) || "");
+  if (stored) {
+    return stored;
+  }
+  return fallbackBackendUrl();
+}
+
+function setStoredBackendUrl(url) {
+  const normalized = normalizeBackendUrl(url);
+  if (!normalized) {
+    localStorage.removeItem(STORAGE_BACKEND_KEY);
+    return "";
+  }
+  localStorage.setItem(STORAGE_BACKEND_KEY, normalized);
+  return normalized;
 }
 
 function cleanName(rawName) {
@@ -76,9 +129,9 @@ function cleanCode(rawCode) {
 }
 
 function formatClock(ms) {
-  const total = Math.max(0, Math.ceil(ms / 1000));
-  const min = Math.floor(total / 60);
-  const sec = total % 60;
+  const totalSeconds = Math.max(0, Math.ceil(ms / 1000));
+  const min = Math.floor(totalSeconds / 60);
+  const sec = totalSeconds % 60;
   return `${String(min).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
 }
 
@@ -113,6 +166,13 @@ function showNameModal(forceOpen) {
   els.nameDisplay.textContent = `Name: ${current || "-"}`;
 }
 
+function updateBackendStatus() {
+  const backend = getStoredBackendUrl();
+  els.backendStatus.textContent = backend
+    ? `Backend: ${backend}`
+    : "Set your Cloudflare Worker URL first.";
+}
+
 function requireName() {
   const name = getStoredName();
   if (!name) {
@@ -123,10 +183,233 @@ function requireName() {
   return name;
 }
 
+function requireBackend() {
+  const backend = getStoredBackendUrl();
+  if (!backend) {
+    setMenuError("Set backend URL first.");
+    return null;
+  }
+  return backend;
+}
+
 function showScreen(screen) {
   els.menuScreen.classList.toggle("hidden", screen !== "menu");
   els.lobbyScreen.classList.toggle("hidden", screen !== "lobby");
   els.gameScreen.classList.toggle("hidden", screen !== "game");
+}
+
+function currentMafiaCooldownMs() {
+  if (!state || state.youRole !== "mafia") {
+    return 0;
+  }
+  return Math.max(0, (state.mafiaCooldownEndsAt || 0) - Date.now());
+}
+
+function wsUrlFromBackend(sessionData) {
+  const backend = new URL(getStoredBackendUrl());
+  backend.protocol = backend.protocol === "https:" ? "wss:" : "ws:";
+  backend.pathname = `/ws/${encodeURIComponent(sessionData.code)}`;
+  backend.search = `pid=${encodeURIComponent(sessionData.playerId)}&sec=${encodeURIComponent(
+    sessionData.sessionSecret
+  )}`;
+  return backend.toString();
+}
+
+async function apiPost(path, payload) {
+  const backend = requireBackend();
+  if (!backend) {
+    throw new Error("Backend URL is missing.");
+  }
+
+  const response = await fetch(`${backend}${path}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+
+  let body = null;
+  try {
+    body = await response.json();
+  } catch {
+    body = null;
+  }
+
+  if (!response.ok || !body?.ok) {
+    throw new Error(body?.error || `Request failed (${response.status})`);
+  }
+  return body;
+}
+
+function clearPendingAcks(reason) {
+  for (const entry of pendingAcks.values()) {
+    clearTimeout(entry.timer);
+    entry.reject(new Error(reason || "Request canceled."));
+  }
+  pendingAcks.clear();
+}
+
+function handleSocketMessage(rawMessage) {
+  let message;
+  try {
+    message = JSON.parse(rawMessage);
+  } catch {
+    return;
+  }
+
+  if (message.type === "state") {
+    state = message.state;
+    render();
+    return;
+  }
+
+  if (message.type === "round_result") {
+    if (message.result?.youWereEliminated) {
+      setChatError("You were eliminated this round.");
+    }
+    return;
+  }
+
+  if (message.type === "ack" && typeof message.reqId === "string") {
+    const pending = pendingAcks.get(message.reqId);
+    if (!pending) {
+      return;
+    }
+    clearTimeout(pending.timer);
+    pendingAcks.delete(message.reqId);
+    if (message.ok) {
+      pending.resolve(message);
+    } else {
+      pending.reject(new Error(message.error || "Action failed."));
+    }
+    return;
+  }
+
+  if (message.type === "error") {
+    setChatError(message.error || "Action failed.");
+    return;
+  }
+
+  if (message.type === "session_invalid") {
+    setMenuError(message.error || "Your session is no longer valid.");
+    leaveLobbyLocally();
+  }
+}
+
+function handleSocketClose() {
+  clearPendingAcks("Connection closed.");
+  ws = null;
+  if (expectedClose) {
+    expectedClose = false;
+    return;
+  }
+  if (session) {
+    state = null;
+    session = null;
+    activeTab = "main";
+    selectedDmPeerId = null;
+    render();
+    setMenuError("Disconnected from lobby.");
+  }
+}
+
+function connectLobbySocket(sessionData) {
+  return new Promise((resolve, reject) => {
+    const url = wsUrlFromBackend(sessionData);
+    const socket = new WebSocket(url);
+    let settled = false;
+
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try {
+        socket.close();
+      } catch {
+        // Ignore close errors.
+      }
+      reject(new Error("Socket connection timed out."));
+    }, 12000);
+
+    socket.onopen = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      expectedClose = false;
+      ws = socket;
+      session = sessionData;
+      setMenuError("");
+      resolve();
+    };
+
+    socket.onmessage = (event) => {
+      handleSocketMessage(event.data);
+    };
+
+    socket.onerror = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      reject(new Error("Could not open WebSocket to backend."));
+    };
+
+    socket.onclose = () => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timeout);
+        reject(new Error("Connection closed before joining lobby."));
+        return;
+      }
+      handleSocketClose();
+    };
+  });
+}
+
+function sendAction(type, payload = {}) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    return Promise.reject(new Error("Not connected to a lobby."));
+  }
+  const reqId = `req-${Date.now()}-${nextReqId++}`;
+  ws.send(JSON.stringify({ type, reqId, ...payload }));
+
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pendingAcks.delete(reqId);
+      reject(new Error("Request timed out."));
+    }, 12000);
+    pendingAcks.set(reqId, { resolve, reject, timer });
+  });
+}
+
+function leaveLobbyLocally() {
+  clearPendingAcks("Left lobby.");
+  if (ws) {
+    expectedClose = true;
+    try {
+      ws.close(1000, "Left lobby");
+    } catch {
+      // Ignore close errors.
+    }
+  } else {
+    expectedClose = false;
+  }
+  ws = null;
+  session = null;
+  state = null;
+  activeTab = "main";
+  selectedDmPeerId = null;
+  setChatError("");
+  render();
+}
+
+async function leaveLobby() {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    expectedClose = true;
+    try {
+      await sendAction("leave_lobby");
+    } catch {
+      // Ignore leave errors and close locally.
+    }
+  }
+  leaveLobbyLocally();
 }
 
 function renderLobbyPlayers() {
@@ -143,9 +426,9 @@ function renderLobbyPlayers() {
 function renderHistory() {
   els.historyList.innerHTML = "";
   if (!state.history.length) {
-    const empty = document.createElement("li");
-    empty.textContent = "No rounds ended yet.";
-    els.historyList.appendChild(empty);
+    const li = document.createElement("li");
+    li.textContent = "No rounds ended yet.";
+    els.historyList.appendChild(li);
     return;
   }
 
@@ -162,7 +445,7 @@ function renderHistory() {
     } else {
       parts.push("No elimination");
     }
-    li.textContent = `${parts.join(" | ")}`;
+    li.textContent = parts.join(" | ");
     els.historyList.appendChild(li);
   }
 }
@@ -251,6 +534,7 @@ function makePlayerRow(player) {
   name.textContent = player.name;
   const sub = document.createElement("div");
   sub.className = "player-meta";
+
   const labels = [];
   labels.push(player.isAlive ? "alive" : "dead");
   if (player.isHost) labels.push("host");
@@ -279,8 +563,10 @@ function makePlayerRow(player) {
 
   if (state.phase === "in_round" && state.youAreAlive && player.isAlive && !player.isSelf) {
     if (state.youRole === "mafia") {
+      const cooldownMs = currentMafiaCooldownMs();
       const killBtn = document.createElement("button");
       killBtn.className = "small-btn kill-btn";
+      killBtn.dataset.targetId = player.id;
       if (state.pendingKillId === player.id) {
         killBtn.textContent = "💀 Set";
       } else if (state.mafiaKillUsedThisRound) {
@@ -288,11 +574,14 @@ function makePlayerRow(player) {
       } else {
         killBtn.textContent = "💀";
       }
-      killBtn.disabled = state.mafiaCooldownMs > 0 || state.mafiaKillUsedThisRound;
-      killBtn.addEventListener("click", () => {
-        socket.emit("mafia_kill", { targetId: player.id }, (response) => {
-          if (!response?.ok) setChatError(response?.error || "Kill action failed.");
-        });
+      killBtn.disabled = cooldownMs > 0 || state.mafiaKillUsedThisRound;
+      killBtn.addEventListener("click", async () => {
+        try {
+          await sendAction("mafia_kill", { targetId: player.id });
+          setChatError("");
+        } catch (error) {
+          setChatError(error.message);
+        }
       });
       actions.appendChild(killBtn);
     }
@@ -301,10 +590,13 @@ function makePlayerRow(player) {
       const saveBtn = document.createElement("button");
       saveBtn.className = "small-btn save-btn";
       saveBtn.textContent = state.pendingSaveId === player.id ? "🙏 Set" : "🙏";
-      saveBtn.addEventListener("click", () => {
-        socket.emit("guardian_save", { targetId: player.id }, (response) => {
-          if (!response?.ok) setChatError(response?.error || "Save action failed.");
-        });
+      saveBtn.addEventListener("click", async () => {
+        try {
+          await sendAction("guardian_save", { targetId: player.id });
+          setChatError("");
+        } catch (error) {
+          setChatError(error.message);
+        }
       });
       actions.appendChild(saveBtn);
     }
@@ -351,24 +643,46 @@ function renderLobbyScreen() {
   }
 }
 
-function renderGameScreen() {
-  els.roleValue.textContent = roleLabel(state.youRole);
-  els.aliveValue.textContent = state.youAreAlive ? "Alive" : "Dead / Spectator";
-  els.roundValue.textContent = state.roundNumber || "-";
-  els.timerValue.textContent = formatClock(state.timeLeftMs || 0);
-  els.winnerValue.textContent = state.winner || "None yet";
+function renderLiveRoundBits() {
+  if (!state || state.phase !== "in_round") {
+    return;
+  }
 
-  if (state.youRole === "mafia" && state.youAreAlive && state.phase === "in_round") {
-    const cooldown = state.mafiaCooldownMs || 0;
+  const timeLeftMs = Math.max(0, (state.roundEndsAt || 0) - Date.now());
+  els.timerValue.textContent = formatClock(timeLeftMs);
+
+  if (state.youRole === "mafia" && state.youAreAlive) {
+    const cooldownMs = currentMafiaCooldownMs();
     if (state.mafiaKillUsedThisRound) {
       els.cooldownText.textContent = "Skull action used for this round.";
+    } else if (cooldownMs > 0) {
+      els.cooldownText.textContent = `Skull cooldown: ${Math.ceil(cooldownMs / 1000)}s`;
     } else {
-      els.cooldownText.textContent =
-        cooldown > 0 ? `Skull cooldown: ${Math.ceil(cooldown / 1000)}s` : "Skull cooldown ready.";
+      els.cooldownText.textContent = "Skull cooldown ready.";
+    }
+
+    const killButtons = els.gamePlayers.querySelectorAll(".kill-btn");
+    for (const button of killButtons) {
+      if (state.pendingKillId === button.dataset.targetId) {
+        button.textContent = "💀 Set";
+      } else if (state.mafiaKillUsedThisRound) {
+        button.textContent = "💀 Used";
+      } else {
+        button.textContent = "💀";
+      }
+      button.disabled = cooldownMs > 0 || state.mafiaKillUsedThisRound;
     }
   } else {
     els.cooldownText.textContent = "";
   }
+}
+
+function renderGameScreen() {
+  els.roleValue.textContent = roleLabel(state.youRole);
+  els.aliveValue.textContent = state.youAreAlive ? "Alive" : "Dead / Spectator";
+  els.roundValue.textContent = state.roundNumber || "-";
+  els.timerValue.textContent = state.phase === "in_round" ? formatClock(state.timeLeftMs || 0) : "00:00";
+  els.winnerValue.textContent = state.winner || "None yet";
 
   if (!state.youAreAlive && state.revealRoles) {
     els.roleReveal.classList.remove("hidden");
@@ -383,6 +697,7 @@ function renderGameScreen() {
   renderPlayersPanel();
   renderChatArea();
   renderHistory();
+  renderLiveRoundBits();
 
   els.chatInput.disabled = !state.canChat;
   if (!state.canChat) {
@@ -393,6 +708,8 @@ function renderGameScreen() {
 function render() {
   const currentName = getStoredName();
   els.nameDisplay.textContent = `Name: ${currentName || "-"}`;
+  els.backendUrlInput.value = getStoredBackendUrl();
+  updateBackendStatus();
 
   if (!state) {
     showScreen("menu");
@@ -422,31 +739,56 @@ els.changeNameBtn.addEventListener("click", () => {
   showNameModal(true);
 });
 
-els.createLobbyBtn.addEventListener("click", () => {
-  const name = requireName();
-  if (!name) return;
-  setMenuError("");
-  socket.emit("create_lobby", { name }, (response) => {
-    if (!response?.ok) {
-      setMenuError(response?.error || "Could not create lobby.");
-    }
-  });
+els.saveBackendBtn.addEventListener("click", () => {
+  const stored = setStoredBackendUrl(els.backendUrlInput.value);
+  if (!stored) {
+    setMenuError("Invalid backend URL.");
+  } else {
+    setMenuError("");
+  }
+  render();
 });
 
-els.joinLobbyBtn.addEventListener("click", () => {
+els.createLobbyBtn.addEventListener("click", async () => {
   const name = requireName();
-  if (!name) return;
+  if (!name || !requireBackend()) return;
+
+  setMenuError("Creating lobby...");
+  try {
+    const created = await apiPost("/api/create-lobby", { name });
+    await connectLobbySocket({
+      code: created.code,
+      playerId: created.playerId,
+      sessionSecret: created.sessionSecret
+    });
+    setMenuError("");
+  } catch (error) {
+    setMenuError(error.message);
+  }
+});
+
+els.joinLobbyBtn.addEventListener("click", async () => {
+  const name = requireName();
+  if (!name || !requireBackend()) return;
+
   const code = cleanCode(els.joinCodeInput.value);
   if (code.length !== 5) {
     setMenuError("Join code must be 5 characters.");
     return;
   }
-  setMenuError("");
-  socket.emit("join_lobby", { name, code }, (response) => {
-    if (!response?.ok) {
-      setMenuError(response?.error || "Could not join lobby.");
-    }
-  });
+
+  setMenuError("Joining lobby...");
+  try {
+    const joined = await apiPost("/api/join-lobby", { name, code });
+    await connectLobbySocket({
+      code: joined.code,
+      playerId: joined.playerId,
+      sessionSecret: joined.sessionSecret
+    });
+    setMenuError("");
+  } catch (error) {
+    setMenuError(error.message);
+  }
 });
 
 els.copyCodeBtn.addEventListener("click", async () => {
@@ -459,30 +801,21 @@ els.copyCodeBtn.addEventListener("click", async () => {
   }
 });
 
-els.startGameBtn.addEventListener("click", () => {
-  socket.emit("start_game", {}, (response) => {
-    if (!response?.ok) {
-      els.startHint.textContent = response?.error || "Could not start game.";
-    }
-  });
+els.startGameBtn.addEventListener("click", async () => {
+  try {
+    await sendAction("start_game");
+    els.startHint.textContent = "";
+  } catch (error) {
+    els.startHint.textContent = error.message;
+  }
 });
 
-els.leaveLobbyBtn.addEventListener("click", () => {
-  socket.emit("leave_lobby", {}, () => {
-    state = null;
-    setChatError("");
-    render();
-  });
+els.leaveLobbyBtn.addEventListener("click", async () => {
+  await leaveLobby();
 });
 
-els.leaveGameBtn.addEventListener("click", () => {
-  socket.emit("leave_lobby", {}, () => {
-    state = null;
-    activeTab = "main";
-    selectedDmPeerId = null;
-    setChatError("");
-    render();
-  });
+els.leaveGameBtn.addEventListener("click", async () => {
+  await leaveLobby();
 });
 
 els.mainTabBtn.addEventListener("click", () => {
@@ -500,7 +833,7 @@ els.dmTargetSelect.addEventListener("change", () => {
   renderDmChat();
 });
 
-els.chatForm.addEventListener("submit", (event) => {
+els.chatForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   if (!state) return;
 
@@ -511,52 +844,29 @@ els.chatForm.addEventListener("submit", (event) => {
     return;
   }
 
-  const clearOnSuccess = (response) => {
-    if (!response?.ok) {
-      setChatError(response?.error || "Message failed.");
-      return;
+  try {
+    if (activeTab === "main") {
+      await sendAction("send_main_message", { text });
+    } else {
+      if (!selectedDmPeerId) {
+        setChatError("Pick a player for private chat.");
+        return;
+      }
+      await sendAction("send_private_message", { toId: selectedDmPeerId, text });
     }
     els.chatInput.value = "";
     setChatError("");
-  };
+  } catch (error) {
+    setChatError(error.message);
+  }
+});
 
-  if (activeTab === "main") {
-    socket.emit("send_main_message", { text }, clearOnSuccess);
+setInterval(() => {
+  if (!state || state.phase !== "in_round") {
     return;
   }
-
-  if (!selectedDmPeerId) {
-    setChatError("Pick a player for private chat.");
-    return;
-  }
-  socket.emit("send_private_message", { toId: selectedDmPeerId, text }, clearOnSuccess);
-});
-
-socket.on("state", (nextState) => {
-  state = nextState;
-  if (state?.players) {
-    const canKeepDm = state.players.some((player) => player.id === selectedDmPeerId && !player.isSelf);
-    if (!canKeepDm) {
-      selectedDmPeerId = null;
-    }
-  }
-  render();
-});
-
-socket.on("round_result", (result) => {
-  if (!result) return;
-  if (result.youWereEliminated) {
-    setChatError("You were eliminated this round.");
-  }
-});
-
-socket.on("disconnect", () => {
-  setMenuError("Disconnected from server. Reconnecting...");
-});
-
-socket.on("connect", () => {
-  setMenuError("");
-});
+  renderLiveRoundBits();
+}, 1000);
 
 showNameModal(false);
 render();

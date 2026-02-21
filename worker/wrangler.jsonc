@@ -1,0 +1,19 @@
+{
+  "name": "texting-mafia-backend",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-02-21",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "TEXTING_MAFIA_LOBBY",
+        "class_name": "LobbyRoom"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["LobbyRoom"]
+    }
+  ]
+}
